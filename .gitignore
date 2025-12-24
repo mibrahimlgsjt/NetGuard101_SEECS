@@ -1,0 +1,49 @@
+.buildozer/
+bin/
+__pycache__/
+*.pyc
+.gradle/
+*.tflite.tmp
+
+# Bytes
+__pycache__/
+*.pyc
+
+# Buildozer / Kivy / Android
+.buildozer/
+bin/
+logs/
+build/
+.gradle/
+*.apk
+*.aab
+
+# Environment
+env/
+venv/
+.venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Large Data (Optional, uncomment if needed)
+# *.pkl
+# *.h5
+# *.tflite
+
+# Logs
+*.log
+security_audit_*.json
+summary_*.txt
+
+# AI Agent Artifacts
+Gemini.md
+agent_summary.md
+Viva_Demo_Summary.md
+
+# Submission Archives
+IDPS_Submission.zip
+NetGuard.zip*
