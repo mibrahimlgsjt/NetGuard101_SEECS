@@ -1,4 +1,4 @@
-# 🛡️ Firewall AI: Intelligent Mobile Security
+# 🛡️ NetGuard101: Intelligent Mobile Security
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Python](https://img.shields.io/badge/python-3.8%2B-yellow.svg) ![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Windows-green.svg) ![Status](https://img.shields.io/badge/status-Active-success.svg)
 
