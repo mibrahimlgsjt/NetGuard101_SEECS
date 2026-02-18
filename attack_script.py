@@ -17,10 +17,14 @@ def print_banner():
     print("=================================================")
     print("\033[0m")
 
-def send_packet(size_min, size_max, count=1, delay=0.1, mode="Normal", payload_override=None):
+def send_packet(size_min, size_max, count=1, delay=0.1, mode="Normal", payload_override=None, target_ip=None, target_port=None):
     """Send UDP packets of random content and specific size range."""
     
-    print(f"\n[*] Initiating {mode} Traffic Simulation...")
+    # Use globals if not provided
+    dest_ip = target_ip if target_ip else TARGET_IP
+    dest_port = target_port if target_port else TARGET_PORT
+
+    print(f"\n[*] Initiating {mode} Traffic Simulation to {dest_ip}:{dest_port}...")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
     try:
@@ -33,7 +37,7 @@ def send_packet(size_min, size_max, count=1, delay=0.1, mode="Normal", payload_o
                 size = random.randint(size_min, size_max)
                 payload = bytes([random.randint(0, 255) for _ in range(size)])
             
-            sock.sendto(payload, (TARGET_IP, TARGET_PORT))
+            sock.sendto(payload, (dest_ip, dest_port))
             
             # Visual Feedback
             status_color = "\033[92m" if "Normal" in mode else ("\033[93m" if "Suspicious" in mode else "\033[91m")

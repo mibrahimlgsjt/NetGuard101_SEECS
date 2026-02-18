@@ -39,7 +39,8 @@ class AndroidUtils:
                 IS_ANDROID = False # Fallback
         
         if not IS_ANDROID:
-            print("INFO: Android API not found. Using MOCK data (Demo Mode).")
+            # Silencing mock initialization logs
+            # print("INFO: Android API not found. Using MOCK data (Demo Mode).")
             from demo_mode import DemoModeManager
             self.demo_manager = DemoModeManager()
 
@@ -149,8 +150,8 @@ class AndroidUtils:
                 print(f"Error in block action: {e}")
                 return False
         else:
-            # Mock Action
-            print(f"[MOCK] Blocked app: {package_name}")
+            # Mock Action (Silenced)
+            # print(f"[MOCK] Blocked app: {package_name}")
             return True
 
 android_utils = AndroidUtils()

@@ -27,11 +27,11 @@ except ImportError:
 # ==============================================================================
 # CONFIGURATION (Auto-filled from Setup)
 # ==============================================================================
+# OFFICIAL SUPABASE INTEGRATION CREDENTIALS
 PROJECT_REF = "pybgyjuonordoljnogdt"
 SUPABASE_URL = f"https://{PROJECT_REF}.supabase.co"
-# Using the Service Role Key for full access during this demo/academic phase.
-# In production, use the Anon Key and RLS policies.
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB5Ymd5anVvbm9yZG9sam5vZ2R0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NjU0ODU5NywiZXhwIjoyMDgyMTI0NTk3fQ.Y9HSup8XwwcIVXrJ09zEM1UQqmIKWC6ED5vnSzdeUhQ"
+# Using the Public Anon Key for Client-Side Integration (RLS Enabled)
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB5Ymd5anVvbm9yZG9sam5vZ2R0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY1NDg1OTcsImV4cCI6MjA4MjEyNDU5N30.9VLzOc1lLjAfaka6TPnxJVJVaf1rGOCre_rs7vgJukM"
 
 class CloudDefenseManager:
     _instance = None

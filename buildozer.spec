@@ -23,7 +23,7 @@ version = 1.0.0
 
 # (list) Application requirements
 # Academic-grade libraries for secure Android build with KivyMD
-requirements = python3,kivy,kivymd,pillow,tensorflow,numpy,cryptography>=41.0.0,pydantic>=2.5.0,httpx>=0.25.0,certifi>=2023.11.17,urllib3>=2.1.0,pyjnius
+requirements = python3,kivy,kivymd,pillow,tflite-runtime,numpy,pyjnius
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
 orientation = portrait

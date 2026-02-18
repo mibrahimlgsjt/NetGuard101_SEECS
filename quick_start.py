@@ -28,7 +28,7 @@ def print_banner():
     banner = """
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
-║    🛡️  IDPS - AI-Powered Intrusion Detection System      ║
+║    🛡️  NetGuard101_SEECS - AI-Powered Intrusion Detection System      ║
 ║                   KivyMD Edition                          ║
 ║                                                           ║
 ║    Industry-Grade Security Monitoring                    ║
@@ -157,9 +157,9 @@ def check_model_file():
         return False
 
 
-def run_app():
+def run_app(demo_mode=False):
     """Launch the IDPS application."""
-    print("\n🚀 Launching IDPS application...\n")
+    print(f"\n🚀 Launching IDPS application{' (DEMO MODE)' if demo_mode else ''}...\n")
     
     if not os.path.exists("main.py"):
         print("❌ main.py not found in current directory")
@@ -170,7 +170,11 @@ def run_app():
         os.environ['KIVY_GL_BACKEND'] = 'angle_sdl2'
         
         # Run the app
-        subprocess.call([sys.executable, "main.py"])
+        cmd = [sys.executable, "main.py"]
+        if demo_mode:
+            cmd.append("--demo")
+            
+        subprocess.call(cmd)
         return True
     except KeyboardInterrupt:
         print("\n\n⏹️ Application stopped by user")
@@ -247,6 +251,11 @@ def main():
         action="store_true",
         help="Show detailed help guide"
     )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run application in Demo Mode"
+    )
     
     args = parser.parse_args()
     
@@ -290,7 +299,7 @@ def main():
         return 0
     
     # Run the app
-    if run_app():
+    if run_app(demo_mode=args.demo):
         print("\n👋 Thanks for using IDPS!")
         return 0
     else:

@@ -1,0 +1,30 @@
+# KivyMD IDPS Application Requirements
+# =====================================
+# Install with: pip install -r requirements-kivymd.txt
+
+# Core UI Framework
+kivy>=2.3.0
+kivymd>=1.1.1
+kivy-gradient>=0.0.1
+
+# ML/AI Libraries
+tensorflow>=2.15.0
+numpy>=1.24.0
+
+# Image Processing
+pillow>=10.0.0
+
+# Security Libraries (from original requirements)
+cryptography>=41.0.0
+pydantic>=2.5.0
+httpx>=0.25.0
+certifi>=2023.11.17
+urllib3>=2.1.0
+
+# Additional Utilities
+python-dateutil>=2.8.2
+
+# Android Build Tools (optional, for buildozer)
+# buildozer>=1.5.0
+# cython>=3.0.0
+

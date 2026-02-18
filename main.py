@@ -22,11 +22,18 @@ from idps.cloud_manager import CloudDefenseManager # Collaborative Defense Modul
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
+# Suppress verbose logs from dependencies
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
 import threading
 import time
 import uuid # For unique log IDs
 from datetime import datetime
 from typing import List, Dict, Tuple
+from collections import deque
 
 from kivy.clock import Clock
 from kivy.lang import Builder
@@ -52,12 +59,56 @@ except ImportError:
 
 # Import Android Utils
 try:
-    from android_utils import android_utils
-    ANDROID_AVAILABLE = True
+    from kivy.utils import platform
+    from android_utils import android_utils, IS_ANDROID
+    ANDROID_AVAILABLE = IS_ANDROID or (platform == 'android')
 except ImportError:
+    from kivy.utils import platform
     android_utils = None
-    ANDROID_AVAILABLE = False
+    ANDROID_AVAILABLE = (platform == 'android')
+    print("WARNING: Android Utils not available. Using Kivy platform detection.")
+
     print("WARNING: Android Utils not available.")
+
+# ============================================================================
+# CONSOLIDATED LOGGING SETUP
+# ============================================================================
+import sys
+
+class StreamLogger(object):
+    """
+    Redirects stdout/stderr to both console and a log file.
+    Ensures that ALL print statements and errors are captured.
+    """
+    def __init__(self, filename="consolidated_debug.log"):
+        self.terminal = sys.stdout
+        self.filename = filename
+        # Clear previous log on startup
+        with open(self.filename, 'w', encoding='utf-8') as f:
+            f.write(f"=== NETGUARD SESSION STARTED: {datetime.now()} ===\n")
+
+    def write(self, message):
+        self.terminal.write(message)
+        try:
+            with open(self.filename, 'a', encoding='utf-8') as f:
+                f.write(message)
+        except:
+            pass # Fail silently if file locked
+
+    def flush(self):
+        self.terminal.flush()
+
+    def close(self):
+        # logging module calls close() on shutdown
+        pass
+
+# Redirect Streams
+sys.stdout = StreamLogger("consolidated_debug.log")
+# sys.stderr = StreamLogger("consolidated_debug.log") # Optional: Redirect stderr too 
+# (Note: Redirecting stderr might mask some crash info if the logger crashes, but usually safe)
+# sys.stderr = sys.stdout # Merge stderr into stdout logger (DISABLED to prevent absl AttributeError on close)
+
+print("INFO: Logging system initialized. Writing to consolidated_debug.log")
 
 # ============================================================================
 # AUDIT LOGGING UTILITY
@@ -71,23 +122,27 @@ class SecurityAuditLogger:
     def __init__(self, log_dir=None):
         if log_dir is None:
             # Android/Cross-platform compatibility
-            from kivy.utils import platform
-            if platform == 'android':
-                from jnius import autoclass
-                PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                # Use external files dir (app specific, no permission needed usually) or files dir
-                # Activity -> getExternalFilesDir(None)
-                try:
-                    activity = PythonActivity.mActivity
-                    file_p = activity.getExternalFilesDir(None)
-                    if file_p:
-                       self.log_dir = os.path.join(str(file_p.getAbsolutePath()), "logs")
-                    else:
-                       self.log_dir = "logs"
-                except Exception as e:
-                    print(f"Error getting Android path: {e}")
+            try:
+                from kivy.utils import platform
+                if platform == 'android':
+                    try:
+                        from jnius import autoclass
+                        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                        # Use external files dir (app specific, no permission needed usually) or files dir
+                        # Activity -> getExternalFilesDir(None)
+                        activity = PythonActivity.mActivity
+                        file_p = activity.getExternalFilesDir(None)
+                        if file_p:
+                           self.log_dir = os.path.join(str(file_p.getAbsolutePath()), "logs")
+                        else:
+                           self.log_dir = "logs"
+                    except Exception as e:
+                        print(f"Warning: Could not get Android path: {e}")
+                        self.log_dir = "logs"
+                else:
                     self.log_dir = "logs"
-            else:
+            except Exception as e:
+                print(f"Warning: Platform detection failed, using default logs dir: {e}")
                 self.log_dir = "logs"
         else:
             self.log_dir = log_dir
@@ -99,7 +154,10 @@ class SecurityAuditLogger:
             if not os.path.exists(self.log_dir):
                 os.makedirs(self.log_dir)
         except Exception as e:
-             print(f"CRITICAL: Failed to create log dir {self.log_dir}: {e}")
+             print(f"Warning: Failed to create log dir {self.log_dir}: {e}")
+             # Fallback - use current directory
+             self.log_file = "security_audit.json"
+             self.summary_file = "summary_log.txt"
         
     def log_event(self, event_type: str, details: Dict):
         # Append a new event to the JSON log file.# 
@@ -190,7 +248,7 @@ class AcademicSecurityManager:
         
         for bad_ip in BLACKLIST_IPS:
                 if ip_address == bad_ip:
-                    import threading
+
                     threading.Thread(target=self.play_threat_alarm, daemon=True).start()
                     threading.Thread(target=self.play_threat_alarm, daemon=True).start()
                     if hasattr(self, 'cloud_manager'):
@@ -202,7 +260,7 @@ class AcademicSecurityManager:
         
         for sig in BAD_SIGNATURES:
             if sig in payload:
-                import threading
+
                 threading.Thread(target=self.play_threat_alarm, daemon=True).start()
                 threading.Thread(target=self.play_threat_alarm, daemon=True).start()
                 if hasattr(self, 'cloud_manager'):
@@ -218,7 +276,7 @@ class AcademicSecurityManager:
             if byte_val == 0x90:
                 nop_count += 1
                 if nop_count >= threshold:
-                    import threading
+
                     threading.Thread(target=self.play_threat_alarm, daemon=True).start()
                     return self.THREAT, "BUFFER OVERFLOW ATTEMPT (NOP Sled Detected)"
             else:
@@ -232,11 +290,30 @@ class AcademicSecurityManager:
         self.interpreter = None
         self.input_details = None
         self.output_details = None
+        self.lock = threading.Lock()
+        
+        # State
+        self.is_monitoring = False
         self.current_threat_level = self.SAFE
+        self.callbacks = []
+        
+        # Stats
         self.threat_count = 0
         self.packets_analyzed = 0
-        self.is_monitoring = False
-        self.callbacks = []
+        self.start_time = time.time()
+        self.recent_logs = deque(maxlen=100)
+        
+        # NEW: Advanced Analytics
+        from collections import Counter
+        self.attack_stats = Counter()
+        self.last_packet_time = time.time()
+        self.pps_window = deque(maxlen=10) # Rolling window for PPS
+        # Map specific rules/signatures to Attack Types
+        self._attack_signatures = {
+            "Suspicious Payload Size": "Buffer Overflow Probe",
+            "Malicious Payload Pattern": "Malware Signature",
+            "Abnormal Traffic Pattern": "Anomaly Scan"
+        }
         
         try:
             import winsound
@@ -244,12 +321,10 @@ class AcademicSecurityManager:
         except ImportError:
             self.sound_available = False
         
-        import threading
-        self.lock = threading.Lock()
+
         self.socket_thread = None
         
-        from collections import deque
-        self.recent_logs = deque(maxlen=100)
+
         self.load_existing_logs()
         
         self.load_model()
@@ -262,7 +337,7 @@ class AcademicSecurityManager:
 
         self.global_bans = []
         try:
-             import threading
+
              threading.Thread(target=self._fetch_bans, daemon=True).start()
         except:
              pass
@@ -284,28 +359,43 @@ class AcademicSecurityManager:
                 pass
 
     def load_existing_logs(self):
+        # Efficiently load the last 100 relevant security events from disk.
         try:
             if os.path.exists(audit_logger.log_file):
                 with open(audit_logger.log_file, 'r', encoding='utf-8') as f:
-                    lines_to_read = f.readlines()[-100:]
-                    for line in lines_to_read:
+                    all_lines = f.readlines()
+                    relevant_events = []
+                    
+                    # Search from end for the most recent 100 relevant events
+                    for line in reversed(all_lines):
+                        if len(relevant_events) >= 100:
+                            break
                         try:
                             data = json.loads(line)
-                            if data.get("event_type") == "PACKET_ANALYSIS":
+                            # Broaden scope: Analyze AI blocks, Rule blocks, and specific detections
+                            if data.get("event_type") in ["PACKET_ANALYSIS", "RULE_BLOCK", "IPS_DETECTION"]:
                                 d = data.get("details", {})
-                                self.recent_logs.appendleft({
+                                sev = d.get("severity", "INFO")
+                                
+                                entry = {
                                     "id": str(uuid.uuid4()),
                                     "time": data.get("timestamp", "").split(" ")[-1],
-                                    "ip": d.get("ip", "Unknown"),
-                                    "event": d.get("event", "Log Event"),
-                                    "threat": "critical" if d.get("severity")=="CRITICAL" else "safe",
-                                    "protocol": "TCP",
-                                    "port": "0"
-                                })
+                                    "ip": d.get("ip") or d.get("ip_address") or "Unknown",
+                                    "event": d.get("event") or d.get("reason") or "Security Event",
+                                    "threat": "critical" if sev == "CRITICAL" else ("high" if sev == "WARNING" else "safe"),
+                                    "protocol": d.get("protocol") or "TCP",
+                                    "port": str(d.get("port", "0")),
+                                    "source": "Audit Log (Disk)"
+                                }
+                                relevant_events.append(entry)
                         except:
-                            pass
-        except:
-             pass
+                            continue
+                            
+                    for entry in reversed(relevant_events):
+                        self.recent_logs.appendleft(entry)
+        except Exception as e:
+             print(f"CACHE ERROR: {e}")
+
 
     def load_model(self):
         if not TFLITE_AVAILABLE:
@@ -437,46 +527,43 @@ class AcademicSecurityManager:
                 "event": event,
                 "threat": threat,
                 "protocol": proto,
-                "port": str(port)
+                "port": str(port),
+                "source": "Simulation Engine"
             })
         
+        # IMPORT TRIGGER (Lazy import to avoid circular dep if needed, but top level is fine usually)
+        import attack_script
+        
+        target_ip = "127.0.0.1" # Localhost for self-testing
+        target_port = 5005
+        
+        print(f"SIMULATION: Running {scenario} via attack_script...")
+        
         if scenario == "random":
-             packet_features = np.random.randn(1, 78).astype(np.float32)
-             self.analyze_traffic(packet_features)
+             # Existing random features fallback OR simple ping
+             attack_script.send_packet(20, 100, count=5, delay=0.2, mode="Normal", target_ip=target_ip, target_port=target_port)
+             
         elif scenario == "baseline":
              print("SIMULATION: Running Baseline Traffic...")
-             for i in range(20):
-                 packet_features = np.random.normal(0.1, 0.1, (1, 78)).astype(np.float32)
-                 sim_ip = f"192.168.1.{np.random.randint(20, 100)}"
-                 self.analyze_traffic(packet_features, src_ip=sim_ip)
-                 event = np.random.choice(["HTTP GET Request", "DNS Query", "TLS Handshake"])
-                 _sim_log(sim_ip, event, "safe", "TCP", np.random.choice([80, 443]))
-                 time.sleep(0.15) 
+             # 20 Safe packets
+             attack_script.send_packet(20, 60, count=20, delay=0.1, mode="Safe HTTP", target_ip=target_ip, target_port=target_port)
+                 
         elif scenario == "suspicious":
-             target_ip = "192.168.1.200"
-             src_ip = "45.33.22.11"
-             print(f"SIMULATION: Detect Port Scan from {src_ip}...")
-             ports = [21, 22, 23, 80]
-             for i in range(30):
-                 is_scan = (i % 3 == 0)
-                 mean = 0.65 if is_scan else 0.2
-                 packet_features = np.random.normal(mean, 0.15, (1, 78)).astype(np.float32)
-                 self.analyze_traffic(packet_features, src_ip=src_ip)
-                 if is_scan and i < len(ports):
-                     p = ports[i]
-                     _sim_log(src_ip, f"SCAN: Port {p} Probed", "high", "TCP", p)
-                 time.sleep(0.1)
+             print(f"SIMULATION: Port Scan...")
+             # Mix of traffic
+             attack_script.send_packet(400, 600, count=10, delay=0.1, mode="Scanning", target_ip=target_ip, target_port=target_port)
+
         elif scenario == "attack":
-             src_ip = "10.0.0.66"
-             print("SIMULATION: SYN FLOOD ATTACK ...")
-             for i in range(50):
-                 packet_features = np.random.normal(0.9, 0.05, (1, 78)).astype(np.float32)
-                 self.analyze_traffic(packet_features, src_ip=src_ip)
-                 if i % 5 == 0:
-                      _sim_log(src_ip, "SYN_FLOOD Packet Dropped", "critical", "TCP", 443)
-                 time.sleep(0.05)
-        if self.socket_thread and self.socket_thread.is_alive():
-            self.is_monitoring = False
+             print("SIMULATION: FULL ATTACK ...")
+             # Triggers Buffer Overflow / Critical Rules
+             # 1. Send some noise
+             attack_script.send_packet(10, 50, count=5, delay=0.05, mode="Noise", target_ip=target_ip, target_port=target_port)
+             # 2. Helper to send NOP Sled (Trigger Rule 2 in logic if implemented, or just high payload)
+             payload = b"\x90" * 50 + b"\xcc" * 10
+             attack_script.send_packet(0, 0, count=1, mode="BUFFER_OVERFLOW_ATTEMPT", payload_override=payload, target_ip=target_ip, target_port=target_port)
+             # 3. Flood
+             attack_script.send_packet(800, 1200, count=15, delay=0.05, mode="DDoS Flood", target_ip=target_ip, target_port=target_port)
+
         audit_logger.log_event("SIMULATION_END", {"scenario": scenario})
 
     def start_monitoring(self):
@@ -501,7 +588,13 @@ class AcademicSecurityManager:
                     data, addr = sock.recvfrom(1024)
                     rule_threat, rule_reason = self.check_rules(addr[0], data)
                     if rule_threat == self.THREAT:
-                        print(f"🛑 BLOCKED PACKET from {addr[0]}: {rule_reason}")
+                        print(f"[BLOCKED] BLOCKED PACKET from {addr[0]}: {rule_reason}")
+                        
+                        # TRACK ATTACK TYPE
+                        attack_type = self._attack_signatures.get(rule_reason, f"Rule: {rule_reason}")
+                        with self.lock:
+                             self.attack_stats[attack_type] += 1
+                        
                         audit_logger.log_event("RULE_BLOCK", {
                             "ip": addr[0],
                             "reason": rule_reason,
@@ -518,7 +611,8 @@ class AcademicSecurityManager:
                              "event": f"BLOCKED: {rule_reason}",
                              "threat": "critical",
                              "protocol": "UDP",
-                             "port": str(udp_port)
+                             "port": str(udp_port),
+                             "source": "Live Firewall (Localhost)"
                         })
                         self._notify_callbacks(self.THREAT, 1.0)
                         continue
@@ -534,16 +628,24 @@ class AcademicSecurityManager:
 
     def stop_monitoring(self):
         self.is_monitoring = False
-        print("🛑 Security monitoring stopped")
+        print("[STOP] Security monitoring stopped")
         audit_logger.log_event("MONITORING_STATE", {"status": "STOPPED"})
 
     def get_stats(self):
         with self.lock:
+            # Calculate PPS
+            now = time.time()
+            # Simple PPS: packets since last check / time delta? 
+            # Or use a rolling window. Let's used a basic approximation.
+            # For simplicity, we just return the raw counters and let UI calculate rates if needed, 
+            # OR we compute instant PPS here if we tracked last update.
+            
             return {
                 'threat_level': self.current_threat_level,
                 'threat_count': self.threat_count,
                 'packets_analyzed': self.packets_analyzed,
-                'is_monitoring': self.is_monitoring
+                'is_monitoring': self.is_monitoring,
+                'attack_stats': dict(self.attack_stats)
             }
 
     def _notify_callbacks(self, threat_level: int, confidence: float):
@@ -560,6 +662,9 @@ class AcademicSecurityManager:
             except Exception as e:
                 print(f"Callback Error: {e}")
 
+import webbrowser
+from kivy.animation import Animation
+
 class StatusCard(MDCard):
     """
     Large status card that changes color based on threat level.
@@ -567,6 +672,15 @@ class StatusCard(MDCard):
     status_text = StringProperty("SAFE")
     status_color = ListProperty([0.2, 0.7, 0.3, 1])  # Green by default
     
+    def on_kv_post(self, base_widget):
+        self.start_pulse()
+
+    def start_pulse(self):
+        icon = self.ids.shield_icon
+        anim = Animation(opacity=0.5, duration=1.0) + Animation(opacity=1, duration=1.0)
+        anim.repeat = True
+        anim.start(icon)
+
     def update_status(self, threat_level: int):
         # Update card based on threat level.# 
         if threat_level == AcademicSecurityManager.THREAT:
@@ -578,7 +692,6 @@ class StatusCard(MDCard):
         else:
             self.status_text = "SYSTEM SAFE"
             self.status_color = [0.2, 0.7, 0.3, 1]  # Green
-
 
 class NetworkGraphCard(MDCard):
     """
@@ -747,6 +860,8 @@ class DashboardScreen(MDScreen):
             from kivymd.toast import toast
             toast("System Statistics & Logs Reset")
     
+            self.status_text = f"SIMULATING {scenario.upper()}..."
+
     def simulate_scan(self, scenario: str = "random"):
         # Simulate a network scan with various scenarios.# 
         if self.security_manager:
@@ -763,6 +878,43 @@ class DashboardScreen(MDScreen):
             toast(f"Running {scenario} simulation...")
             self.status_text = f"SIMULATING {scenario.upper()}..."
 
+    def load_mock_data(self):
+        """Manually trigger mock data injection for Android testing."""
+        try:
+            from mock_data import generate_mock_log
+            mock_event = generate_mock_log()
+            if self.security_manager:
+                # Add to memory logs
+                entry = {
+                    "id": str(uuid.uuid4()),
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "ip": mock_event['ip'],
+                    "event": f"MOCK: {mock_event['reason']}",
+                    "threat": "critical" if mock_event['event_type'] != "PACKET_ANALYSIS" else "safe",
+                    "protocol": "MOCK",
+                    "port": "8080",
+                    "source": "Android Mock Engine"
+                }
+                self.security_manager.recent_logs.appendleft(entry)
+                
+                # Check if it should trigger an alert
+                if entry['threat'] == 'critical':
+                    # Call the callback via security manager state if needed, 
+                    # but here we can just update the count and stats
+                    self.security_manager.threat_count += 1
+                    # Trigger visual alarm if applicable
+                    app = MDApp.get_running_app()
+                    if hasattr(app, 'on_threat_detected'):
+                        app.on_threat_detected(AcademicSecurityManager.THREAT, {"ip": entry['ip'], "reason": entry['event']})
+                
+                self.security_manager.packets_analyzed += 1
+                self.update_dashboard(0)
+                
+                from kivymd.toast import toast
+                toast("Mock Security Event Injected")
+        except Exception as e:
+            print(f"Mock injection error: {e}")
+
 
 class FirewallScreen(MDScreen):
     """
@@ -778,8 +930,8 @@ class FirewallScreen(MDScreen):
         """Populate the list of apps."""
         # Get apps from android_utils (which uses DemoMode or Real API)
         # For UI demo, we want a rich list, so we might augment it
-        if hasattr(App.get_running_app(), 'android_utils'):
-             apps = App.get_running_app().android_utils.get_running_apps()
+        if hasattr(MDApp.get_running_app(), 'android_utils'):
+             apps = MDApp.get_running_app().android_utils.get_running_apps()
         else:
              apps = []
         
@@ -845,7 +997,36 @@ class NetworkLogsScreen(MDScreen):
             self.refresh_logs()
         
         # Auto-refresh logs every few seconds while on this screen
-        Clock.schedule_interval(self.auto_refresh, 2.0)
+        Clock.schedule_interval(self.auto_refresh, 3.0)
+        
+        # Trigger background Cloud Sync
+        threading.Thread(target=self.fetch_cloud_threats, daemon=True).start()
+
+    def fetch_cloud_threats(self):
+        """Fetch recent threats from Supabase and integrate them into the local log feed."""
+        if self.security_manager and hasattr(self.security_manager, 'cloud_manager'):
+            cm = self.security_manager.cloud_manager
+            if cm and cm.enabled:
+                print("☁️  CLOUD: Synchronizing global threat intelligence...")
+                recent = cm.get_recent_threats(limit=20)
+                if recent:
+                    new_logs = []
+                    for t in recent:
+                         new_logs.append({
+                             "id": f"cloud_{t.get('id', uuid.uuid4())}",
+                             "time": t.get('created_at', '').split('T')[-1][:8],
+                             "ip": t.get('ip_address', 'Unknown'),
+                             "event": "GLOBAL THREAT INTEL",
+                             "threat": "high",
+                             "protocol": "Cloud Sync",
+                             "port": "N/A",
+                             "source": "Collaborative Defense"
+                         })
+                    # Batch append to local state
+                    for log in reversed(new_logs):
+                        if log['id'] not in [l.get('id') for l in self.security_manager.recent_logs]:
+                             self.security_manager.recent_logs.appendleft(log)
+                    print(f"☁️  CLOUD: Synced {len(new_logs)} global threats.")
 
     def on_leave(self):
         Clock.unschedule(self.auto_refresh)
@@ -998,6 +1179,8 @@ class NetworkLogsScreen(MDScreen):
                 # Unique ID
                 log_id = log.get("id", f"{log['time']}_{log['ip']}_{log['event']}_legacy")
                 
+
+                
                 if log_id not in self.displayed_hashes:
                     # It's a new log! Add it.
                     self.displayed_hashes.add(log_id)
@@ -1014,7 +1197,7 @@ class NetworkLogsScreen(MDScreen):
                         icon = "shield-check"
                         text_color = [0.2, 0.8, 0.4, 1]  # Green
                         
-                    log_text = f"[{log['time']}] {log['ip']} - {log['event']}"
+                    log_text = f"[{log.get('time', '??:??:??')}] {log.get('ip', 'Unknown')} - {log.get('event', 'Unknown Event')}"
                     
                     item = OneLineAvatarIconListItem(
                         text=log_text,
@@ -1050,16 +1233,55 @@ class NetworkLogsScreen(MDScreen):
 
     
     def show_log_details(self, log):
-        # Show detailed log information.# 
+        # Show detailed log information.
+        
+        # Build Source Info
+        source = log.get('source', 'Unknown Source')
+        
         details_text = f"""
-Time: {log['time']}
-IP Address: {log['ip']}
-Event: {log['event']}
-Threat Level: {log['threat'].upper()}
-Protocol: {log['protocol']}
-Port: {log['port']}
-        # 
-# 
+Time: {log.get('time', 'N/A')}
+IP Address: {log.get('ip', 'N/A')}
+Event: {log.get('event', 'N/A')}
+Threat Level: {log.get('threat', 'safe').upper()}
+Protocol: {log.get('protocol', 'N/A')}
+Port: {log.get('port', 'N/A')}
+Source: {source}
+ID: {log.get('id', 'N/A')}
+        """
+        
+        dialog = MDDialog(
+            title="Network Event Details",
+            text=details_text,
+            buttons=[
+                MDFlatButton(
+                    text="CLOSE",
+                    on_release=lambda x: dialog.dismiss()
+                ),
+                MDFlatButton(
+                    text="BLOCK IP",
+                    on_release=lambda x: self.block_ip(log.get('ip'), dialog)
+                )
+            ]
+        )
+        dialog.open()
+
+    def block_ip(self, ip, dialog):
+        # Simulate blocking an IP address.
+        dialog.dismiss()
+        if not ip: return
+        
+        # Show confirmation
+        confirm = MDDialog(
+            title="IP Blocked",
+            text=f"IP Address {ip} has been blocked successfully.\\n(Added to Firewall Rule #1024)",
+            buttons=[
+                MDFlatButton(
+                    text="OK",
+                    on_release=lambda x: confirm.dismiss()
+                )
+            ]
+        )
+        confirm.open() 
 # dialog = MDDialog(
 # title="Network Event Details",
 # text=details_text,
@@ -1093,8 +1315,9 @@ Port: {log['port']}
 # confirm.open()
 # 
 # 
-# class SettingsScreen(MDScreen):
-    # 
+
+class SettingsScreen(MDScreen):
+    """
     Settings Screen
     
     Features:
@@ -1143,6 +1366,13 @@ Port: {log['port']}
         # Toggle threat alerts.# 
         status = "enabled" if value else "disabled"
         print(f"Threat Alerts {status}")
+        
+    def open_github(self):
+        import webbrowser
+        webbrowser.open("https://github.com/mibrahimlgsjt/NetGuard101_SEECS")
+
+    def open_github(self):
+        webbrowser.open("https://github.com/mibrahimlgsjt/NetGuard101_SEECS")
 
 
 class AnalyticsScreen(MDScreen):
@@ -1158,6 +1388,8 @@ class AnalyticsScreen(MDScreen):
     threat_ratio = NumericProperty(0.0)
     risk_level = StringProperty("SECURE")
     risk_color = ListProperty([0.0, 1.0, 0.53, 1])  # Default Cyan/Green
+    attack_stats_text = StringProperty("No Active Threats")
+
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1217,6 +1449,20 @@ class AnalyticsScreen(MDScreen):
             # IDLE STATE
             self.risk_level = "SYSTEM IDLE"
             self.risk_color = [0.5, 0.5, 0.5, 1]
+            
+        # ----------------------------------------------------
+        # 2. UPDATE ATTACK STATS UI
+        # ----------------------------------------------------
+        attack_stats = stats.get('attack_stats', {})
+        if attack_stats:
+             # Sort by count desc
+             sorted_attacks = sorted(attack_stats.items(), key=lambda item: item[1], reverse=True)
+             text_lines = []
+             for name, count in sorted_attacks[:5]:
+                 text_lines.append(f"{name}: {count}")
+             self.attack_stats_text = "\n".join(text_lines)
+        else:
+             self.attack_stats_text = "No Active Threats Detected"
 
 
 # ============================================================================
@@ -1235,8 +1481,12 @@ class IDPSApp(MDApp):
     - Real-time threat monitoring
     """
     
-    def __init__(self, **kwargs):
+    
+    android_available = BooleanProperty(ANDROID_AVAILABLE)
+    
+    def __init__(self, demo_mode=False, **kwargs):
         super().__init__(**kwargs)
+        self.demo_mode = demo_mode
         self.security_manager = None
         self.android_utils = android_utils
         self.blocked_apps = ["com.android.chrome"] # Example blacklist
@@ -1244,11 +1494,11 @@ class IDPSApp(MDApp):
 
     
     def build(self):
-        # 
-# Build and initialize the application.
-# 
-# This is the main entry point called by KivyMD.
-        # 
+        # Build and initialize the application.
+        # This is the main entry point called by KivyMD.
+        
+        print("[BUILD] Starting app build...")
+        
         # Set app theme - Cyber Security Dark Theme
         self.theme_cls.primary_palette = "Teal"
         self.theme_cls.primary_hue = "700"
@@ -1257,22 +1507,36 @@ class IDPSApp(MDApp):
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.material_style = "M3"  # Material Design 3
         
+        print("[BUILD] Theme configured")
+        
         # Initialize Security Manager
         self.security_manager = AcademicSecurityManager()
+        
+        print("[BUILD] Security manager initialized")
         
         # Register callback for threat notifications
         self.security_manager.register_callback(self.on_threat_detected)
         
+        print("[BUILD] Callback registered")
+        
         # Start monitoring
         self.security_manager.start_monitoring()
         
+        print("[BUILD] Monitoring started")
+        
         # Start Android Loops if available
         if ANDROID_AVAILABLE:
+            print("[BUILD] Starting Android background loop")
             self.monitor_event = Clock.schedule_interval(self.android_background_loop, 2.0)
+        else:
+            print("[BUILD] Android not available")
 
         
         # Load KV file with UI design
-        return Builder.load_string(KV_STRING)
+        print("[BUILD] Loading KV string...")
+        root = Builder.load_string(KV_STRING)
+        print("[BUILD] KV loaded successfully")
+        return root
     
     def on_start(self):
         # Called after build() when app is starting.# 
@@ -1280,11 +1544,19 @@ class IDPSApp(MDApp):
         # HIERARCHY: MDScreenManager -> MainAppScreen -> MDBottomNavigation -> Screens
         
         try:
-            main_app = self.root.ids.main_app_screen
+            if not self.root:
+                print("ERROR: Root widget not initialized")
+                return
+                
+            main_app = self.root.ids.get('main_app_screen')
+            if not main_app:
+                print("ERROR: main_app_screen not found in root.ids")
+                return
             
             # Access dashboard screen (it is an ID within MainAppScreen rule)
-            dashboard = main_app.ids.dashboard_screen
-            dashboard.security_manager = self.security_manager
+            dashboard = main_app.ids.get('dashboard_screen')
+            if dashboard:
+                dashboard.security_manager = self.security_manager
             
             analytics = main_app.ids.get('analytics_screen')
             if analytics:
@@ -1293,10 +1565,47 @@ class IDPSApp(MDApp):
             logs = main_app.ids.get('logs_screen')
             if logs:
                 logs.security_manager = self.security_manager
+                
+            # TRIGGER DEMO MODE IF ACTIVE
+            if self.demo_mode:
+                self.start_demo_sequence()
+                
         except Exception as e:
             print(f"ERROR: Could not link security manager to screens: {e}")
-            # Fallback for debugging if hierarchy is different
-            pass
+            import traceback
+            traceback.print_exc()
+            
+    def start_demo_sequence(self):
+        """Run a scripted demo sequence for presentation."""
+        print("DEMO MODE: Starting automated sequence...")
+        try:
+            from kivymd.toast import toast
+            toast("DEMO MODE ACTIVATED")
+            
+            # Get dashboard safely
+            dashboard = None
+            try:
+                if self.root and self.root.ids:
+                    main_app = self.root.ids.get('main_app_screen')
+                    if main_app:
+                        dashboard = main_app.ids.get('dashboard_screen')
+            except:
+                pass
+            
+            if not dashboard:
+                print("Warning: Could not access dashboard for demo sequence")
+                return
+            
+            # 1. Start with Baseline traffic
+            Clock.schedule_once(lambda dt: dashboard.simulate_scan("baseline"), 2)
+            
+            # 2. Inject Suspicious Activity after 8 seconds
+            Clock.schedule_once(lambda dt: dashboard.simulate_scan("suspicious"), 10)
+            
+            # 3. Simulate Full Attack after 15 seconds
+            Clock.schedule_once(lambda dt: dashboard.simulate_scan("attack"), 20)
+        except Exception as e:
+            print(f"Demo sequence error: {e}")
     
     def on_threat_detected(self, threat_level: int, data: Dict):
         # 
@@ -1317,7 +1626,7 @@ class IDPSApp(MDApp):
         if threat_level >= AcademicSecurityManager.SUSPICIOUS:
             # Show visible alert on App
             bg_color = [0.8, 0, 0, 1] if threat_level == AcademicSecurityManager.THREAT else [0.9, 0.5, 0, 1]
-            text = f"⚠ THREAT DETECTED: Level {threat_level} ({data['confidence']:.1%})"
+            text = f"[WARN] THREAT DETECTED: Level {threat_level} ({data.get('confidence', 0):.1%})"
             
             try:
                 from kivymd.uix.snackbar import MDSnackbar
@@ -1340,37 +1649,56 @@ class IDPSApp(MDApp):
                  print(f"Snackbar error: {e}")
 
             # Force update dashboard status immediately
-            dashboard = self.root.ids.dashboard_screen
-            if dashboard:
-                dashboard.status_text = "THREAT DETECTED" if threat_level == AcademicSecurityManager.THREAT else "SUSPICIOUS ACTIVITY"
-                # Trigger dashboard update
-                dashboard.update_dashboard(0)
+            try:
+                if self.root and self.root.ids:
+                    dashboard = self.root.ids.main_app_screen.ids.get('dashboard_screen')
+                    if dashboard:
+                        dashboard.status_text = "THREAT DETECTED" if threat_level == AcademicSecurityManager.THREAT else "SUSPICIOUS ACTIVITY"
+                        # Trigger dashboard update
+                        dashboard.update_dashboard(0)
+            except Exception as e:
+                print(f"Dashboard update error: {e}")
     
     def android_background_loop(self, dt):
         """Background loop to check for blocked apps and update data stats."""
-        if not self.android_utils:
+        if not self.android_utils or not ANDROID_AVAILABLE:
             return
 
-        # 1. Update Data Usage on Dashboard
-        usage = self.android_utils.get_data_usage()
-        dashboard = self.root.ids.dashboard_screen
-        if dashboard:
-             # Convert bytes to MB
-             to_mb = lambda b: f"{b / (1024*1024):.1f} MB"
-             dashboard.data_mobile_rx = to_mb(usage['mobile_rx'])
-             dashboard.data_mobile_tx = to_mb(usage['mobile_tx'])
-             dashboard.data_total_rx = to_mb(usage['total_rx'])
-             dashboard.data_total_tx = to_mb(usage['total_tx'])
- 
-
-        # 2. Check Blocked Apps
-        # Only if we have permission
-        if self.android_utils.has_usage_stats_permission():
-            running_apps = self.android_utils.get_running_apps()
-            for app_name in running_apps:
-                if app_name in self.blocked_apps:
-                    print(f"Blocking app: {app_name}")
-                    self.android_utils.block_app_action(app_name)
+        try:
+            # 1. Update Data Usage on Dashboard
+            main_app = self.root.ids.get('main_app_screen')
+            dashboard = main_app.ids.get('dashboard_screen') if main_app else None
+            
+            if hasattr(self.android_utils, 'get_data_usage'):
+                usage = self.android_utils.get_data_usage()
+                if dashboard:
+                     # Convert bytes to MB
+                     to_mb = lambda b: f"{b / (1024*1024):.1f} MB" if b > 0 else "0 MB"
+                     dashboard.data_mobile_rx = to_mb(usage.get('mobile_rx', 0))
+                     dashboard.data_mobile_tx = to_mb(usage.get('mobile_tx', 0))
+                     dashboard.data_total_rx = to_mb(usage.get('total_rx', 0))
+                     dashboard.data_total_tx = to_mb(usage.get('total_tx', 0))
+     
+            # 2. Check Blocked Apps
+            if hasattr(self.android_utils, 'has_usage_stats_permission'):
+                if self.android_utils.has_usage_stats_permission():
+                    running_apps = self.android_utils.get_running_apps() or []
+                    for app_name in running_apps:
+                        if app_name in self.blocked_apps:
+                            if hasattr(self.android_utils, 'block_app_action'):
+                                self.android_utils.block_app_action(app_name)
+                                
+            # 3. MOCK DATA INJECTION (Periodic)
+            # Inject a mock threat every ~30 seconds (15 loops since dt=2.0)
+            if not hasattr(self, '_loop_count'): self._loop_count = 0
+            self._loop_count += 1
+            if self._loop_count % 15 == 0:
+                print("DEBUG: Periodic Android background mock injection")
+                if dashboard:
+                    dashboard.load_mock_data()
+                    
+        except Exception as e:
+            print(f"Android loop error (non-critical): {e}")
     
     def on_stop(self):
         # Called when app is closing.# 
@@ -1386,15 +1714,11 @@ class IDPSApp(MDApp):
 
 KV_STRING = """
 #:import get_color_from_hex kivy.utils.get_color_from_hex
-#:import Gradient kivy_gradient.Gradient
 
 # FIREWALL AI THEME CONSTANTS
-# Backgrounds
 #:set C_BG "#121212"
 #:set C_SURFACE "#1E1E1E"
 #:set C_SURFACE_LIGHT "#2C2C2C"
-
-# Accents
 #:set C_PRIMARY "#FF9800"
 #:set C_ACCENT "#FFB74D"
 #:set C_WARN "#FF5252"
@@ -1406,7 +1730,40 @@ KV_STRING = """
     header_text_color_active: get_color_from_hex(C_PRIMARY)
     header_text_color_normal: get_color_from_hex(C_TEXT_SEC)
 
-<AuthScreen>
+<StatusCard>:
+    orientation: 'vertical'
+    padding: dp(20)
+    spacing: dp(15)
+    radius: [dp(20)]
+    md_bg_color: get_color_from_hex(C_SURFACE)
+    elevation: 4
+    
+    # Glowing Circle Background
+    canvas.before:
+        Color:
+            rgba: [root.status_color[0], root.status_color[1], root.status_color[2], 0.1]
+        Ellipse:
+            pos: self.center_x - dp(100), self.center_y - dp(60)
+            size: dp(200), dp(200)
+    
+    MDIcon:
+        id: shield_icon
+        icon: 'shield-check' if root.status_text == "SYSTEM SAFE" else 'shield-alert'
+        halign: 'center'
+        font_size: dp(80)
+        theme_text_color: 'Custom'
+        text_color: root.status_color
+        pos_hint: {"center_x": .5}
+
+    MDLabel:
+        text: root.status_text
+        halign: "center"
+        font_style: "H6"
+        bold: True
+        theme_text_color: "Custom"
+        text_color: root.status_color
+
+<AuthScreen>:
     name: 'auth'
     MDBoxLayout:
         orientation: 'vertical'
@@ -1417,37 +1774,28 @@ KV_STRING = """
         MDCard:
             orientation: 'vertical'
             size_hint: None, None
-            size: dp(320), dp(400)
+            size: dp(320), dp(450)
             pos_hint: {'center_x': 0.5, 'center_y': 0.5}
             elevation: 10
             radius: [dp(20)]
             padding: dp(20)
-            spacing: dp(20)
+            spacing: dp(15)
             md_bg_color: get_color_from_hex(C_SURFACE)
 
             MDLabel:
-                text: "SECURE ACCESS"
+                text: "IDPS NETGUARD"
                 halign: "center"
                 font_style: "H5"
                 bold: True
                 theme_text_color: "Custom"
                 text_color: get_color_from_hex(C_PRIMARY)
-                size_hint_y: None
-                height: dp(40)
             
-            Widget:
-                size_hint_y: None
-                height: dp(10)
-
             MDTextField:
                 id: email
                 hint_text: "Email Address"
                 icon_right: "email"
                 mode: "rectangle"
                 line_color_focus: get_color_from_hex(C_PRIMARY)
-                hint_text_color_focus: get_color_from_hex(C_PRIMARY)
-                text_color_focus: get_color_from_hex(C_TEXT_PRI)
-                text_color_normal: get_color_from_hex(C_TEXT_SEC)
             
             MDTextField:
                 id: password
@@ -1456,49 +1804,51 @@ KV_STRING = """
                 password: True
                 mode: "rectangle"
                 line_color_focus: get_color_from_hex(C_PRIMARY)
-                hint_text_color_focus: get_color_from_hex(C_PRIMARY)
             
-            Widget:
-                size_hint_y: None
-                height: dp(10)
-
             MDRaisedButton:
                 id: login_btn
-                text: "LOGIN"
+                text: "LOGIN TO CLOUD"
                 pos_hint: {"center_x": 0.5}
                 size_hint_x: 1
                 md_bg_color: get_color_from_hex(C_PRIMARY)
-                text_color: get_color_from_hex('#000000')
+                text_color: [0,0,0,1]
                 on_release: root.login()
                 
             MDFlatButton:
                 id: signup_btn
-                text: "CREATE ACCOUNT"
+                text: "CREATE NEW ACCOUNT"
                 pos_hint: {"center_x": 0.5}
                 size_hint_x: 1
                 theme_text_color: "Custom"
                 text_color: get_color_from_hex(C_ACCENT)
                 on_release: root.signup()
 
+            MDLabel:
+                text: "OR"
+                halign: "center"
+                font_style: "Caption"
+                theme_text_color: "Secondary"
 
-<MainAppScreen>
+            MDRaisedButton:
+                text: "SKIP (PC DEMO)"
+                pos_hint: {"center_x": 0.5}
+                size_hint_x: 1
+                md_bg_color: get_color_from_hex(C_SURFACE_LIGHT)
+                on_release: app.root.current = 'main_app'
+
+<MainAppScreen>:
     name: 'main_app'
-    
     MDBoxLayout:
         orientation: 'vertical'
-        
         MDBottomNavigation:
             id: tab_manager
             panel_color: get_color_from_hex(C_SURFACE_LIGHT)
             text_color_active: get_color_from_hex(C_PRIMARY)
-            text_color_normal: get_color_from_hex(C_TEXT_SEC)
-            selected_color_background: get_color_from_hex(C_SURFACE)
             
             MDBottomNavigationItem:
                 name: 'dashboard'
-                text: 'Protection'
+                text: 'Home'
                 icon: 'shield-home'
-                
                 DashboardScreen:
                     id: dashboard_screen
 
@@ -1506,824 +1856,274 @@ KV_STRING = """
                 name: 'apps'
                 text: 'Apps'
                 icon: 'view-grid'
-                
                 FirewallScreen:
                     id: firewall_screen
 
             MDBottomNavigationItem:
                 name: 'logs'
                 text: 'Logs'
-                icon: 'chart-bar'
-                
+                icon: 'text-box-search'
                 NetworkLogsScreen:
                     id: logs_screen
 
             MDBottomNavigationItem:
+                name: 'analytics'
+                text: 'Risk'
+                icon: 'trending-up'
+                AnalyticsScreen:
+                    id: analytics_screen
+
+            MDBottomNavigationItem:
                 name: 'settings'
-                text: 'Settings'
+                text: 'Tools'
                 icon: 'cog'
-                
                 SettingsScreen:
                     id: settings_screen
 
-<FirewallScreen>:
+<DashboardScreen>:
     md_bg_color: get_color_from_hex(C_BG)
-    
     MDBoxLayout:
         orientation: 'vertical'
         
-        # Header
         MDTopAppBar:
-            title: "Manage Apps"
+            title: "SECURITY DASHBOARD"
             md_bg_color: get_color_from_hex(C_BG)
             specific_text_color: get_color_from_hex(C_TEXT_PRI)
             elevation: 0
-            right_action_items: [["filter-variant", lambda x: None], ["magnify", lambda x: None]]
             
+        ScrollView:
+            MDBoxLayout:
+                orientation: 'vertical'
+                padding: dp(20)
+                spacing: dp(20)
+                adaptive_height: True
+                
+                StatusCard:
+                    id: status_card
+                    size_hint_y: None
+                    height: dp(200)
+
+                MDGridLayout:
+                    cols: 2
+                    spacing: dp(15)
+                    size_hint_y: None
+                    height: dp(100)
+                    
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(15)
+                        md_bg_color: get_color_from_hex(C_SURFACE)
+                        radius: [dp(15)]
+                        MDLabel:
+                            text: "SESSIONS"
+                            font_style: 'Caption'
+                            theme_text_color: 'Secondary'
+                        MDLabel:
+                            text: str(root.packets_count)
+                            font_style: 'H5'
+                            bold: True
+                            theme_text_color: 'Custom'
+                            text_color: get_color_from_hex(C_PRIMARY)
+                    
+                    MDCard:
+                        orientation: 'vertical'
+                        padding: dp(15)
+                        md_bg_color: get_color_from_hex(C_SURFACE)
+                        radius: [dp(15)]
+                        MDLabel:
+                            text: "THREATS"
+                            font_style: 'Caption'
+                            theme_text_color: 'Secondary'
+                        MDLabel:
+                            text: str(root.threats_count)
+                            font_style: 'H5'
+                            bold: True
+                            theme_text_color: 'Custom'
+                            text_color: get_color_from_hex(C_WARN)
+
+                MDRaisedButton:
+                    text: "FORCE ANALYTIC SCAN"
+                    icon: "radar"
+                    pos_hint: {"center_x": .5}
+                    size_hint_x: 1
+                    height: dp(50)
+                    md_bg_color: get_color_from_hex('#00897B')
+                    on_release: root.simulate_scan("random")
+
+                MDRaisedButton:
+                    text: "RESET SYSTEM STATS"
+                    icon: "refresh"
+                    pos_hint: {"center_x": .5}
+                    size_hint_x: 0.8
+                    md_bg_color: get_color_from_hex('#455A64')
+                    on_release: root.reset_statistics()
+
+                MDRaisedButton:
+                    text: "LOAD MOCK DATA"
+                    icon: "database-plus"
+                    pos_hint: {"center_x": .5}
+                    size_hint_x: 1 if app.android_available else 0
+                    opacity: 1 if app.android_available else 0
+                    disabled: not app.android_available
+                    md_bg_color: get_color_from_hex(C_ACCENT)
+                    text_color: [0,0,0,1]
+                    on_release: root.load_mock_data()
+
+<FirewallScreen>:
+    md_bg_color: get_color_from_hex(C_BG)
+    MDBoxLayout:
+        orientation: 'vertical'
+        MDTopAppBar:
+            title: "Manage Apps"
+            md_bg_color: get_color_from_hex(C_BG)
+            elevation: 0
         ScrollView:
             MDList:
                 id: app_list
                 padding: dp(10)
-                spacing: dp(10)
+                spacing: dp(5)
 
 <NetworkLogsScreen>:
     md_bg_color: get_color_from_hex(C_BG)
-    
     MDBoxLayout:
         orientation: 'vertical'
-        
-        # Header
-        MDBoxLayout:
-            size_hint_y: None
-            height: dp(60)
-            padding: dp(15)
-            
-            MDLabel:
-                text: "Traffic Logs"
-                font_style: 'H5'
-                bold: True
-                theme_text_color: 'Custom'
-                text_color: get_color_from_hex(C_TEXT_PRI)
-            
-            MDIconButton:
-                icon: "refresh"
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_ACCENT)
-                on_release: root.refresh_logs()
-
-        # Bar Chart Mockup
-        MDCard:
-            size_hint_y: None
-            height: dp(150)
-            md_bg_color: get_color_from_hex(C_SURFACE)
-            radius: [dp(0), dp(0), dp(20), dp(20)]
-            elevation: 0
-            padding: dp(10)
-            
-            MDBoxLayout:
-                orientation: 'vertical'
-                MDLabel:
-                    text: "Data Statistics (Week)"
-                    font_style: "Caption"
-                    theme_text_color: "Custom"
-                    text_color: get_color_from_hex(C_TEXT_SEC)
-                    size_hint_y: None
-                    height: dp(20)
-                
-                # Simple Bar Visual using Labels/Colors
-                MDBoxLayout:
-                    spacing: dp(5)
-                    padding: [0, dp(10), 0, 0]
-                    
-                    # Bar 1
-                    MDRelativeLayout:
-                        MDCard:
-                            size_hint: (1, 0.4)
-                            pos_hint: {'bottom': 1}
-                            md_bg_color: get_color_from_hex(C_PRIMARY)
-                            radius: [dp(4)]
-                    # Bar 2
-                    MDRelativeLayout:
-                        MDCard:
-                            size_hint: (1, 0.6)
-                            pos_hint: {'bottom': 1}
-                            md_bg_color: get_color_from_hex(C_PRIMARY)
-                            radius: [dp(4)]
-                    # Bar 3
-                    MDRelativeLayout:
-                        MDCard:
-                            size_hint: (1, 0.3)
-                            pos_hint: {'bottom': 1}
-                            md_bg_color: get_color_from_hex(C_PRIMARY)
-                            radius: [dp(4)]
-                    # Bar 4
-                    MDRelativeLayout:
-                        MDCard:
-                            size_hint: (1, 0.8)
-                            pos_hint: {'bottom': 1}
-                            md_bg_color: get_color_from_hex(C_WARN) # Threat spike
-                            radius: [dp(4)]
-                    # Bar 5
-                    MDRelativeLayout:
-                        MDCard:
-                            size_hint: (1, 0.5)
-                            pos_hint: {'bottom': 1}
-                            md_bg_color: get_color_from_hex(C_PRIMARY)
-                            radius: [dp(4)]
-                            
+        MDTopAppBar:
+            title: "Security Logs"
+            md_bg_color: get_color_from_hex(C_BG)
+            right_action_items: [["refresh", lambda x: root.refresh_logs()], ["download", lambda x: root.export_logs()]]
         ScrollView:
             MDList:
                 id: log_list
 
-<SettingsScreen>:
+<AnalyticsScreen>:
     md_bg_color: get_color_from_hex(C_BG)
-    
-    ScrollView:
-        MDList:
-            id: settings_list
-            padding: dp(20)
-            
-            OneLineIconListItem:
-                text: "Global Protection"
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_TEXT_PRI)
-                IconLeftWidget:
-                    icon: "shield-check"
-                    theme_text_color: "Custom"
-                    text_color: get_color_from_hex(C_OK)
-
-            OneLineIconListItem:
-                text: "Notifications"
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_TEXT_PRI)
-                IconLeftWidget:
-                    icon: "bell"
-                    theme_text_color: "Custom"
-                    text_color: get_color_from_hex(C_ACCENT)
-
-            OneLineIconListItem:
-                text: "Dark Mode"
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_TEXT_PRI)
-                IconLeftWidget:
-                    icon: "brightness-4"
-                    theme_text_color: "Custom"
-                    text_color: get_color_from_hex(C_PRIMARY)
-
-    md_bg_color: get_color_from_hex(C_BG)
-
-    
     MDBoxLayout:
         orientation: 'vertical'
+        padding: dp(20)
+        spacing: dp(20)
         
-        # 1. HEADER
-        MDBoxLayout:
+        MDLabel:
+            text: "RISK LEVEL ANALYSIS"
+            font_style: 'H5'
+            bold: True
+            theme_text_color: "Custom"
+            text_color: get_color_from_hex(C_TEXT_PRI)
+            
+        MDCard:
+            orientation: 'vertical'
+            padding: dp(20)
+            md_bg_color: get_color_from_hex(C_SURFACE)
+            radius: [dp(20)]
             size_hint_y: None
-            height: dp(80)
-            padding: [dp(20), dp(20), dp(20), 0]
+            height: dp(150)
             
             MDLabel:
-                text: "FIREWALL AI"
-                font_style: 'H4'
+                text: root.risk_level
+                halign: 'center'
+                font_style: 'H3'
                 bold: True
-                valign: 'center'
                 theme_text_color: 'Custom'
-                text_color: get_color_from_hex(C_TEXT_PRI)
+                text_color: root.risk_color
             
-            MDIconButton:
-                icon: "shield-check"
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_PRIMARY)
-                user_font_size: "32sp"
-                pos_hint: {"center_y": .6}
+            MDProgressBar:
+                value: root.threat_ratio * 100
+                color: root.risk_color
+                size_hint_y: None
+                height: dp(20)
 
-        # 2. CENTRAL SHIELD UI
+        MDLabel:
+            text: f"Cumulative Scanned: {root.total_scanned}"
+            theme_text_color: "Secondary"
+
+        MDCard:
+            orientation: 'vertical'
+            padding: dp(15)
+            md_bg_color: get_color_from_hex(C_SURFACE)
+            radius: [dp(15)]
+            size_hint_y: None
+            height: dp(150)
+            
+            MDLabel:
+                text: "LIVE PREDICTED ATTACKS"
+                font_style: 'H6'
+                theme_text_color: 'Custom'
+                text_color: get_color_from_hex(C_WARN)
+                size_hint_y: None
+                height: dp(30)
+                
+            MDLabel:
+                text: root.attack_stats_text
+                font_style: 'Body1'
+                theme_text_color: 'Custom'
+                text_color: get_color_from_hex(C_TEXT_SEC)
+                valign: 'top'
+
+<SettingsScreen>:
+    md_bg_color: get_color_from_hex(C_BG)
+    ScrollView:
         MDBoxLayout:
             orientation: 'vertical'
             padding: dp(20)
             spacing: dp(20)
+            adaptive_height: True
             
-            Widget: # Spacer top
-                size_hint_y: 0.1
-                
-            MDBoxLayout: # Shield Container
+            MDLabel:
+                text: "SYSTEM PREFERENCES"
+                font_style: 'H6'
+                theme_text_color: "Secondary"
+            
+            MDList:
+                id: settings_list
+                OneLineIconListItem:
+                    text: "Toggle Dark Theme"
+                    IconLeftWidget:
+                        icon: "brightness-4"
+                OneLineIconListItem:
+                    text: "Cloud Sync Status"
+                    IconLeftWidget:
+                        icon: "cloud-check"
+                OneLineIconListItem:
+                    text: "View on GitHub"
+                    on_release: root.open_github()
+                    IconLeftWidget:
+                        icon: "github"
+            
+            MDCard:
                 orientation: 'vertical'
+                padding: dp(20)
+                spacing: dp(5)
                 size_hint_y: None
-                height: dp(220)
-                pos_hint: {"center_x": .5}
+                height: dp(250)
+                md_bg_color: get_color_from_hex(C_SURFACE_LIGHT)
+                radius: [dp(15)]
                 
-                # Glowing Circle Background
-                canvas.before:
-                    Color:
-                        rgba: get_color_from_hex(C_PRIMARY if root.status_text == "SYSTEM SAFE" else C_WARN)
-                        a: 0.1
-                    Ellipse:
-                        pos: self.center_x - dp(110), self.center_y - dp(110)
-                        size: dp(220), dp(220)
-                    Color:
-                        rgba: get_color_from_hex(C_PRIMARY if root.status_text == "SYSTEM SAFE" else C_WARN)
-                        a: 0.2
-                    Line:
-                        circle: (self.center_x, self.center_y, dp(100))
-                        width: 2
-
-                MDIcon:
-                    icon: 'shield' if root.status_text == "SYSTEM SAFE" else 'shield-alert'
-                    halign: 'center'
-                    font_size: dp(100)
-                    theme_text_color: 'Custom'
-                    text_color: get_color_from_hex(C_PRIMARY if root.status_text == "SYSTEM SAFE" else C_WARN)
-                    pos_hint: {"center_x": .5, "center_y": .5}
-
-            MDLabel:
-                text: "Control status:"
-                halign: "center"
-                font_style: "Body1"
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_TEXT_SEC)
-                size_hint_y: None
-                height: dp(20)
-
-            MDLabel:
-                text: "ACTIVE" if root.status_text == "SYSTEM SAFE" else "THREAT DETECTED"
-                halign: "center"
-                font_style: "H5"
-                bold: True
-                theme_text_color: "Custom"
-                text_color: get_color_from_hex(C_PRIMARY if root.status_text == "SYSTEM SAFE" else C_WARN)
-                size_hint_y: None
-                height: dp(30)
-
-            MDBoxLayout:
-                orientation: 'horizontal'
-                spacing: dp(15)
-                size_hint_y: None
-                height: dp(60)
-                padding: [dp(5), 0]
-                adaptive_width: True
-                pos_hint: {"center_x": .5}
-
-                MDRaisedButton:
-                    text: "SCAN NOW"
-                    icon: "radar"
-                    pos_hint: {'center_y': 0.5}
-                    md_bg_color: get_color_from_hex('#00897B')
-                    text_color: get_color_from_hex('#E0F2F1')
-                    elevation: 4
-                    on_release: dashboard_screen.simulate_scan("random")
-
-                MDRaisedButton:
-                    text: "RESET"
-                    icon: "restart"
-                    pos_hint: {'center_y': 0.5}
-                    md_bg_color: get_color_from_hex('#00695C')
-                    text_color: get_color_from_hex('#E0F2F1')
-                    elevation: 4
-                    on_release: dashboard_screen.reset_statistics()
-                                
-                                # Bottom Spacer for mobile scrolling
-                                Widget:
-                                    size_hint_y: None
-                                    height: dp(20)
-            
-            MDBottomNavigationItem:
-                name: 'analytics'
-                text: 'Analytics'
-                icon: 'chart-arc'
+                MDLabel:
+                    text: "NETGUARD PROJECT"
+                    bold: True
+                    theme_text_color: "Custom"
+                    text_color: get_color_from_hex(C_PRIMARY)
                 
-                AnalyticsScreen:
-                    id: analytics_screen
-                    
-                    MDBoxLayout:
-                        orientation: 'vertical'
-                        padding: dp(20)
-                        spacing: dp(20)
-                        
-                        MDTopAppBar:
-                            title: "[ IPS ANALYTICS ]"
-                            elevation: 4
-                            md_bg_color: get_color_from_hex('#004D40')
-                            specific_text_color: get_color_from_hex('#00E5FF')
-                        
-                        MDCard:
-                            orientation: 'vertical'
-                            padding: dp(20)
-                            spacing: dp(15)
-                            radius: [dp(20)]
-                            md_bg_color: get_color_from_hex('#002B27')
-                            size_hint_y: None
-                            height: dp(200)
-                            
-                            MDLabel:
-                                text: "ENVIRONMENT RISK LEVEL"
-                                halign: 'center'
-                                font_style: 'Subtitle2'
-                                theme_text_color: 'Custom'
-                                text_color: get_color_from_hex('#4DB6AC')
-                                
-                            MDLabel:
-                                text: analytics_screen.risk_level
-                                halign: 'center'
-                                font_style: 'H4'
-                                bold: True
-                                theme_text_color: 'Custom'
-                                text_color: analytics_screen.risk_color
-                                
-                            MDProgressBar:
-                                value: analytics_screen.threat_ratio * 100
-                                color: analytics_screen.risk_color
-                                
-                        MDGridLayout:
-                            cols: 2
-                            spacing: dp(15)
-                            adaptive_height: True
-                            
-                            MDCard:
-                                orientation: 'vertical'
-                                padding: dp(15)
-                                size_hint_y: None
-                                height: dp(100)
-                                md_bg_color: get_color_from_hex('#002B27')
-                                
-                                MDLabel:
-                                    text: "TOTAL SCANNED"
-                                    font_style: 'Caption'
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#4DB6AC')
-                                MDLabel:
-                                    text: str(analytics_screen.total_scanned)
-                                    font_style: 'H5'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-    
-                            MDCard:
-                                orientation: 'vertical'
-                                padding: dp(15)
-                                size_hint_y: None
-                                height: dp(100)
-                                md_bg_color: get_color_from_hex('#002B27')
-                                
-                                MDLabel:
-                                    text: "BLOCKED RATIO"
-                                    font_style: 'Caption'
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#4DB6AC')
-                                MDLabel:
-                                    text: f"{analytics_screen.threat_ratio:.1%}"
-                                    font_style: 'H5'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#FF5252')
-                        
-                        Widget: # Spacer
-            
-            MDBottomNavigationItem:
-                name: 'logs'
-                text: 'Logs'
-                icon: 'text-box-outline'
+                MDLabel:
+                    text: "Developed by: MUHAMMAD IBRAHIM"
+                    font_style: "Caption"
+                    theme_text_color: "Secondary"
                 
-                NetworkLogsScreen:
-                    id: logs_screen
-                    
-                    MDBoxLayout:
-                        orientation: 'vertical'
-                        
-                        # Top App Bar - Cyber Theme
-                        MDTopAppBar:
-                            title: "[ SECURITY EVENT LOGS ]"
-                            elevation: 4
-                            md_bg_color: get_color_from_hex('#004D40')
-                            specific_text_color: get_color_from_hex('#00E5FF')
-                            left_action_items: [["text-box-multiple", lambda x: None]]
-                            right_action_items: [["refresh", lambda x: logs_screen.refresh_logs()], ["download", lambda x: logs_screen.export_logs()]]
-                        
-                        # Stats Header for Logs
-                        MDBoxLayout:
-                            size_hint_y: None
-                            height: dp(30)
-                            padding: [dp(20), 0]
-                            md_bg_color: get_color_from_hex('#002521')
-                            
-                            MDLabel:
-                                text: logs_screen.stats_text
-                                font_style: 'Caption'
-                                theme_text_color: 'Custom'
-                                text_color: get_color_from_hex('#80CBC4')
-                                halign: "center"
-                                bold: True
-                                
-                            MDLabel:
-                                 # Access analytics_screen if possible or just use static text "Live Feed"
-                                text: "LIVE FEED ACTIVE"
-                                font_style: 'Caption'
-                                theme_text_color: 'Custom'
-                                text_color: get_color_from_hex('#00E5FF')
-                                halign: "center"
-                        
-    
-                        
-                        # Logs List
-                        ScrollView:
-                            do_scroll_x: False
-                            
-                            MDList:
-                                id: log_list
-                                
-            MDBottomNavigationItem:
-                name: 'settings'
-                text: 'Settings'
-                icon: 'cog'
+                MDLabel:
+                    text: "Mentorship/Guidance:\\nDr. Khurram Shehzad"
+                    halign: 'left'
+                    font_style: 'Caption'
+                    theme_text_color: "Custom"
+                    text_color: get_color_from_hex(C_OK)
                 
-                SettingsScreen:
-                    id: settings_screen
-                    
-                    MDBoxLayout:
-                        orientation: 'vertical'
-                        
-                        # Top App Bar - Cyber Theme
-                        MDTopAppBar:
-                            title: "[ SYSTEM SETTINGS ]"
-                            elevation: 4
-                            md_bg_color: get_color_from_hex('#004D40')
-                            specific_text_color: get_color_from_hex('#00E5FF')
-                            left_action_items: [["cog-outline", lambda x: None]]
-                        
-                        ScrollView:
-                            do_scroll_x: False
-                            
-                            MDBoxLayout:
-                                orientation: 'vertical'
-                                spacing: dp(10)
-                                padding: dp(15)
-                                adaptive_height: True
-                                
-                                # Appearance Section
-                                MDLabel:
-                                    text: "[ APPEARANCE ]"
-                                    font_style: 'Subtitle1'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-                                    size_hint_y: None
-                                    height: dp(40)
-                                
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(80)
-                                    elevation: 6
-                                    padding: dp(15)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00695C80')
-                                   
-                                    MDBoxLayout:
-                                        orientation: 'horizontal'
-                                        
-                                        MDIcon:
-                                            icon: 'theme-light-dark'
-                                            size_hint_x: None
-                                            width: dp(40)
-                                            theme_text_color: 'Custom'
-                                            text_color: 1, 1, 1, 1
-                                        
-                                        MDLabel:
-                                            text: "DARK MODE"
-                                            font_style: 'Subtitle1'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#E0F2F1')
-                                        
-                                        MDSwitch:
-                                            id: theme_switch
-                                            pos_hint: {'center_y': 0.5}
-                                            active: app.theme_cls.theme_style == "Dark"
-                                            thumb_color_active: get_color_from_hex('#00E5FF')
-                                            track_color_active: get_color_from_hex('#00897B')
-                                            on_active: settings_screen.toggle_theme(self, self.active)
-                                
-                                # Theme Color Selection
-                                MDLabel:
-                                    text: "[ COLOR PALETTE ]"
-                                    font_style: 'Subtitle1'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-                                    size_hint_y: None
-                                    height: dp(40)
-                                
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(100)
-                                    elevation: 6
-                                    padding: dp(15)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00695C80')
-                                   
-                                    MDBoxLayout:
-                                        spacing: dp(12)
-                                        padding: dp(5)
-                                        
-                                        MDIconButton:
-                                            icon: 'checkbox-blank-circle'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#00BCD4')
-                                            on_release: settings_screen.change_primary_color('Cyan')
-                                            md_bg_color: get_color_from_hex('#00000040')
-                                        
-                                        MDIconButton:
-                                            icon: 'checkbox-blank-circle'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#00897B')
-                                            on_release: settings_screen.change_primary_color('Teal')
-                                            md_bg_color: get_color_from_hex('#00000040')
-                                        
-                                        MDIconButton:
-                                            icon: 'checkbox-blank-circle'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#4CAF50')
-                                            on_release: settings_screen.change_primary_color('Green')
-                                            md_bg_color: get_color_from_hex('#00000040')
-                                        
-                                        MDIconButton:
-                                            icon: 'checkbox-blank-circle'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#9C27B0')
-                                            on_release: settings_screen.change_primary_color('Purple')
-                                            md_bg_color: get_color_from_hex('#00000040')
-                                        
-                                        MDIconButton:
-                                            icon: 'checkbox-blank-circle'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#FF5722')
-                                            on_release: settings_screen.change_primary_color('DeepOrange')
-                                            md_bg_color: get_color_from_hex('#00000040')
-                                
-                                # Security Section
-                                MDLabel:
-                                    text: "[ SECURITY CONTROLS ]"
-                                    font_style: 'Subtitle1'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-                                    size_hint_y: None
-                                    height: dp(40)
-                                
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(80)
-                                    elevation: 6
-                                    padding: dp(15)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00695C80')
-                                   
-                                    MDBoxLayout:
-                                        orientation: 'horizontal'
-                                        
-                                        MDIcon:
-                                            icon: 'shield-lock'
-                                            size_hint_x: None
-                                            width: dp(40)
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#4CAF50')
-                                        
-                                        MDLabel:
-                                            text: "AI PROTECTION"
-                                            font_style: 'Subtitle1'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#E0F2F1')
-                                        
-                                        MDSwitch:
-                                            pos_hint: {'center_y': 0.5}
-                                            active: True
-                                            thumb_color_active: get_color_from_hex('#00FF88')
-                                            track_color_active: get_color_from_hex('#00897B')
-                                            on_active: settings_screen.toggle_ai_protection(self, self.active)
-                                
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(80)
-                                    elevation: 6
-                                    padding: dp(15)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00695C80')
-                                   
-                                    MDBoxLayout:
-                                        orientation: 'horizontal'
-                                        
-                                        MDIcon:
-                                            icon: 'bell-ring'
-                                            size_hint_x: None
-                                            width: dp(40)
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#FF9800')
-                                        
-                                        MDLabel:
-                                            text: "THREAT ALERTS"
-                                            font_style: 'Subtitle1'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#E0F2F1')
-                                        
-                                        MDSwitch:
-                                            pos_hint: {'center_y': 0.5}
-                                            active: True
-                                            thumb_color_active: get_color_from_hex('#FF5252')
-                                            track_color_active: get_color_from_hex('#FF7043')
-                                            on_active: settings_screen.toggle_threat_alerts(self, self.active)
-                                
-                                # App Blocking Section - Android Feature
-                                MDLabel:
-                                    text: "[ APP BLOCKER ]"
-                                    font_style: 'Subtitle1'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-                                    size_hint_y: None
-                                    height: dp(40)
-
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(80)
-                                    elevation: 6
-                                    padding: dp(15)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00695C80')
-                                   
-                                    MDBoxLayout:
-                                        orientation: 'horizontal'
-                                        
-                                        MDIcon:
-                                            icon: 'application-block'
-                                            size_hint_x: None
-                                            width: dp(40)
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#FF1744')
-                                        
-                                        MDLabel:
-                                            text: "BLOCK BLACKLISTED APPS"
-                                            font_style: 'Subtitle1'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#E0F2F1')
-                                        
-                                        MDSwitch:
-                                            pos_hint: {'center_y': 0.5}
-                                            active: True
-                                            thumb_color_active: get_color_from_hex('#FF1744')
-                                            track_color_active: get_color_from_hex('#D32F2F')
-                                            on_active: print("App Blocker Toggled")
-                                
-                                # About Section
-                                MDLabel:
-                                    text: "[ SYSTEM INFO ]"
-                                    font_style: 'Subtitle1'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-                                    size_hint_y: None
-                                    height: dp(40)
-                                
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(220)
-                                    elevation: 6
-                                    padding: dp(20)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00363180')
-                                   
-                                    MDLabel:
-                                        text: "CYBERGUARD AI CORE"
-                                        font_style: 'H6'
-                                        bold: True
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#00E5FF')
-                                    
-                                    MDLabel:
-                                        text: "VERSION 1.0.0 (SECURE-PATCH)"
-                                        font_style: 'Caption'
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#4DB6AC')
-                                    
-                                    Widget:
-                                        size_hint_y: None
-                                        height: dp(15)
-    
-                                    MDGridLayout:
-                                        cols: 2
-                                        MDLabel:
-                                            text: "ML Engine:"
-                                            font_style: 'Caption'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#80CBC4')
-                                        MDLabel:
-                                            text: "TensorFlow Lite"
-                                            font_style: 'Caption'
-                                            halign: 'right'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#00FF88')
-                                        MDLabel:
-                                            text: "Inference:"
-                                            font_style: 'Caption'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#80CBC4')
-                                        MDLabel:
-                                            text: "Async / 12ms"
-                                            font_style: 'Caption'
-                                            halign: 'right'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#00FF88')
-                                        MDLabel:
-                                            text: "Persistence:"
-                                            font_style: 'Caption'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#80CBC4')
-                                        MDLabel:
-                                            text: "JSON Audit Active"
-                                            font_style: 'Caption'
-                                            halign: 'right'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#00FF88')
-                                        MDLabel:
-                                            text: "Framework:"
-                                            font_style: 'Caption'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#80CBC4')
-                                        MDLabel:
-                                            text: "NIST-800-53 (Mod)"
-                                            font_style: 'Caption'
-                                            halign: 'right'
-                                            theme_text_color: 'Custom'
-                                            text_color: get_color_from_hex('#00FF88')
-                                
-                                # Developer Section
-                                MDLabel:
-                                    text: "[ DEVELOPER INFO ]"
-                                    font_style: 'Subtitle1'
-                                    bold: True
-                                    theme_text_color: 'Custom'
-                                    text_color: get_color_from_hex('#00E5FF')
-                                    size_hint_y: None
-                                    height: dp(40)
-                                
-                                MDCard:
-                                    orientation: 'vertical'
-                                    size_hint_y: None
-                                    height: dp(170)
-                                    elevation: 6
-                                    padding: dp(20)
-                                    radius: [dp(15)]
-                                    md_bg_color: get_color_from_hex('#00363180')
-                                   
-                                    MDLabel:
-                                        text: "DEVELOPED BY"
-                                        font_style: 'Caption'
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#4DB6AC')
-                                    
-                                    MDLabel:
-                                        text: "MUHAMMAD IBRAHIM"
-                                        font_style: 'H6'
-                                        bold: True
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#00E5FF')
-                                    
-                                    Widget:
-                                        size_hint_y: None
-                                        height: dp(5)
-                                    
-                                    MDLabel:
-                                        text: "▸ mibrahim13as@gmail.com"
-                                        font_style: 'Body2'
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#80CBC4')
-                                    
-                                    Widget:
-                                        size_hint_y: None
-                                        height: dp(5)
-                                    
-                                    MDLabel:
-                                        text: "SPECIALThanks to :\\nDr. Muhammad Ashraf \\n for his mentorship and guidance"
-                                        font_style: 'Caption'
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#00FF88')
-                                    
-                                    Widget:
-                                        size_hint_y: None
-                                        height: dp(5)
-                                    
-                                    MDLabel:
-                                        text: "(c) 2025 ALL RIGHTS RESERVED"
-                                        font_style: 'Caption'
-                                        theme_text_color: 'Custom'
-                                        text_color: get_color_from_hex('#4DB6AC')
-                                
-                                # Spacer at bottom
-                                Widget:
-                                    size_hint_y: None
-                                    height: dp(20)
+                MDLabel:
+                    text: "(c) 2025 ALL RIGHTS RESERVED"
+                    font_style: 'Caption'
+                    theme_text_color: "Secondary"
+                
+                MDLabel:
+                    text: "V 1.0.0 Stable"
+                    font_style: 'Caption'
+                    theme_text_color: "Secondary"
 
 MDScreenManager:
     id: screen_manager
@@ -2333,8 +2133,7 @@ MDScreenManager:
         id: main_app_screen
 
 
-
-
+# End of KV String
 """
 
 # ============================================================================
@@ -2342,4 +2141,12 @@ MDScreenManager:
 # ============================================================================
 
 if __name__ == '__main__':
-    IDPSApp().run()
+    import sys
+    
+    # Check for and remove --demo argument so Kivy doesn't crash
+    demo_active = False
+    if "--demo" in sys.argv:
+        demo_active = True
+        sys.argv.remove("--demo")
+        
+    IDPSApp(demo_mode=demo_active).run()
