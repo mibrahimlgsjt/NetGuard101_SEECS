@@ -73,4 +73,4 @@ This project implements **Academic-Grade Security Standards**:
 - **Low Footprint**: Optimized for battery life and performance.
 
 ---
-*Created by [Your Name/Team] for SEECS.*
+*Created by Muhammad Ibrahim.*
